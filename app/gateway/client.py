@@ -1,0 +1,90 @@
+import logfire
+from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
+
+from app.config import settings
+
+
+USE_PORTKEY = bool(settings.PORTKEY_API_KEY)
+
+GATEWAY_CONFIG = {
+    "strategy": {"mode": "fallback"},
+    "cache": {"mode": "simple"},
+    "retry": {
+        "attempts": 2,
+        "on_status_codes": [429, 503],
+    },
+    "targets": [
+        {"override_params": {"model": f"@{settings.GROQ_SLUG}/llama-3.3-70b-versatile"}},
+        {"override_params": {"model": f"@{settings.GROQ_SLUG_2}/llama-3.1-8b-instant"}},
+    ],
+}
+
+portkey_client = None
+
+if USE_PORTKEY:
+    from portkey_ai import Portkey, createHeaders, PORTKEY_GATEWAY_URL
+
+    portkey_client = Portkey(
+        api_key=settings.PORTKEY_API_KEY,
+        config=GATEWAY_CONFIG,
+    )
+
+
+def get_langchain_llm(feature: str = "rag"):
+    """Portkey-backed ChatOpenAI when configured; otherwise direct Groq."""
+    if USE_PORTKEY:
+        from portkey_ai import createHeaders, PORTKEY_GATEWAY_URL
+
+        return ChatOpenAI(
+            api_key=settings.PORTKEY_API_KEY,
+            base_url=PORTKEY_GATEWAY_URL,
+            model=f"@{settings.GROQ_SLUG}/llama-3.3-70b-versatile",
+            temperature=0,
+            default_headers=createHeaders(
+                api_key=settings.PORTKEY_API_KEY,
+                config=GATEWAY_CONFIG,
+                metadata={
+                    "feature": feature,
+                    "_user": "rag-system",
+                    "environment": "production",
+                },
+            ),
+        )
+
+    logfire.info("PORTKEY_API_KEY not set — using direct Groq for LLM calls.")
+    return ChatGroq(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+        temperature=0,
+    )
+
+
+def generate_completion(prompt: str, temperature: float = 0.1) -> tuple[str, str]:
+    """Run synthesis via Portkey or direct Groq. Returns (content, cache_status)."""
+    if USE_PORTKEY:
+        response = portkey_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+        )
+        content = response.choices[0].message.content
+        return content, extract_cache_status(response)
+
+    llm = ChatGroq(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+        temperature=temperature,
+    )
+    content = llm.invoke(prompt).content
+    return content, "MISS"
+
+
+def extract_cache_status(response) -> str:
+    """Pull x-portkey-cache-status from Portkey response headers."""
+    for attr in ("_raw_response", "_response", "_http_response"):
+        raw = getattr(response, attr, None)
+        if raw is not None:
+            status = getattr(raw, "headers", {}).get("x-portkey-cache-status", "")
+            if status:
+                return status.upper()
+    return "MISS"
